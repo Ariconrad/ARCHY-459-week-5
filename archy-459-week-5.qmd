@@ -3,3 +3,184 @@ title: "archy-459-week-5"
 format: html
 ---
 
+```{r}
+library(tidyverse)
+library(readxl)
+library(rsample)
+library(yardstick)
+library(torch)
+library(torchvision)
+library(luz)
+library(magick)
+
+```
+
+## Import Data
+
+```{r}
+tww_file <- "data/CNN-Models-Supplement/TWW_data.xlsx"
+image_dir <- "data/Single_Sherd_8_Type_Analyzer/Reference_Database/Reference_Images"
+
+tww <- read_excel(tww_file)
+
+```
+
+recall that in the paper the human experts agree with the consensus about 74-87% of the time
+
+
+
+```{r}
+#| label: sample-prop
+
+type_levels <- c("Kanaa", "Wepo", "Black_Mesa", "Sosi", "Dogoszhi", "Flagstaff", "Tusayan", "Kayenta")
+
+sherds <- tww |>
+  transmute(
+    image = image_file,
+    type = factor(`Human consensus`, levels = type_levels),
+    paper_prediction = `CNN model prediction`
+  ) |>
+  mutate(path = file.path(image_dir, image))
+
+count(sherds, type)
+
+sample_prop <- 0.25 # try o.25 or 0.15
+
+set.seed(459)
+sherd_sample <- sherds |>
+  group_by(type) |>
+  slice_sample(prop = sample_prop) |>
+  ungroup()
+
+count(sherd_sample, type)
+```
+
+## Split the data in training and test sets
+
+```{r}
+set.seed(459)
+sherd_split <- initial_split(sherd_sample, prop = 0.8, strata = type)
+train_df <- training(sherd_split)
+test_df <- testing(sherd_split)
+
+nrow(train_df)
+nrow(test_df)
+
+```
+
+
+## Prepare the images and augment them
+
+```{r}
+source("sherd_helpers.R")
+train_dl <- dataloader(sherd_dataset(train_df, 
+                                     augment = TRUE), 
+                       batch_size = 32, 
+                       shuffle = TRUE)
+
+test_dl <- dataloader(sherd_dataset(test_df, 
+                                    augment = FALSE),
+                      batch_size = 64)
+```
+
+## Transfer learning with a pretained CNN
+
+```{r}
+sherd_net <- nn_module(
+  initialize = function() {
+    self$resnet <- model_resnet18(pretrained = TRUE)
+    self$resnet$fc <- nn_linear(512, 8) # fc refers to the Fully Connected layer
+  },
+  forward = function(x) self$resnet(x)
+)
+```
+
+## Train the network
+
+```{r}
+torch_manual_seed(459)
+
+fitted <- sherd_net |>
+  setup(
+    loss = nn_cross_entropy_loss(),
+    optimizer = optim_adam,
+    metrics = luz_metric_accuracy()
+  ) |>
+  set_opt_hparams(lr = 0.0001) |>
+  fit(train_dl, epochs = 15, valid_data = test_dl, verbose = FALSE)
+```
+
+```{r}
+luz_save(fitted, "sherd_model.luz")
+```
+
+
+## Evaluate the model on the test set
+
+```{r}
+test_logits <- predict(fitted, test_dl)
+test_probs <- as_array(nnf_softmax(test_logits, dim = 2)$cpu())
+
+test_results <- test_df |>
+  mutate(predicted = factor(type_levels[max.col(test_probs)], levels = type_levels))
+
+accuracy(test_results, truth = type, estimate = predicted)
+```
+
+## Compare with the paper
+
+```{r}
+comparison <- tibble(
+  classifier = c("Our ResNet18", "Paper's CNN ensemble"),
+  agreement = c(
+    mean(test_results$predicted == test_results$type),
+    mean(test_results$paper_prediction == test_results$type)
+  )
+)
+```
+
+## Create a Heatmap of the confusion matrix
+
+```{r}
+#| label: Heatmap
+#| fig-cap: "The heatmap compares the true types of the sherds with the predicted type of the sherds from the ResNet18 model. The accuracy of the model was 0.754 for the classification of the 8 different sherd types."
+
+confusion_matrix <- test_results |>
+  count(truth = type, prediction = predicted) |>
+  complete(truth = type_levels, prediction = type_levels, fill = list(n = 0)) |>
+  mutate(
+    truth = factor(truth, levels = type_levels),
+    prediction = factor(prediction, levels = type_levels)
+  )
+
+confusion <- confusion_matrix |>
+  mutate(
+    scaled = n / max(n),
+    text_colour = if_else(scaled > 0.5, "white", "black")
+  )
+
+ggplot(confusion, aes(x = prediction, y = truth, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n, colour = text_colour)) +
+  scale_fill_viridis_c(direction = -1, name = "Count") +
+  scale_colour_identity() +
+  labs(x = "Predicted type", y = "True type") +
+  theme_minimal()
+```
+
+The heatmap created from our ResNet18 model on the confusion matrix showed to have the most accuracy with classifying Dogoszhi, but had the least accuracy in classifying Wepo and Kayenta.Wepo is temporal nieghbors with Kana’a and Black Mesa. Along with not clearly defined attributes, Wepo caused the model the most confusion. Kayenta and Tusayan are also temporal neighbors and the model seems to misclassify some of the sherds for each other. Our model classified none of the 3 Wepo sherds with 2 of the true Wepo sherds misclassified as Black Mesa, also only 3 of the 7 Kayenta sherds were classified correctly with one Tusayan sherd misclassifed as Kayenta and 3 of the true Kayenta sherds were misclassified as Tusayan.
+
+The Sosi and Tusayan type of sherd had the most representation in the dataset, which explains the high count of correctly classified sherds, but both types have a higher percentage of misclassified sherds in the model’s predicated type then with Dogoszhi. The model correctly classified 10 of the 12 Dogoszhi with two other sherds misclassified as Dogoszhi. On the other hand, the model correctly classified 28 of the 32 Sosi sherds with 7 other sherds misclassified as Sosi and correctly classified 24 of the 27 Tusayan sherds with 7 other sherds misclassified as Tusayan. Improvements to the model needs to be done in order to improve the models accuracy, especially for classifying Wepo and Kayenta, because of stylistic similarities between the types.
+
+
+## Is our model's accuracy inside the range of the human analysts? Is that a fair way to judge a CNN?
+
+Our model’s accuracy (0.754) was within the accuracy range of the human analysts on the consensus dataset (0.736-0.869), but higher than the accuracy range of when each selected a single type (0.524-0.626). Since the human analysts were experienced experts in the field, I believe comparing accuracy results is a fair way to judge a CNN. It is good knowledge to have on how accurate the process would be without the model and how the accuracy might change with the use of the model instead of human experts.
+
+
+## Which types are confused most often? Are they neighbours in time? What does this suggest about the types themselves (for example Wepo)?
+
+The Wepo type got confused the most for our CNN model with 2 out of the 3 sherds classified as Black Mesa, also the model was confused with Kayenta in that 3 out of 7 sherds were classified as Tusayan. Wepo does not have as clearly defined attributes associated with the type as the other types, which could explain the confusion with the temporally adjacent types of Kana’a and Black Mesa. There is also temporal overlap with Kayenta and Tusayan, so there are stylistic similarities between the two types that causes confusion to the model.
+
+
+
